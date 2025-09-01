@@ -48,10 +48,10 @@ filter_tags = [tag.strip() for tag in filter_tags_str.split(',') if tag.strip()]
 
 
 # Configuración de archivos de log de salida
-ALERTS_LOG_FILE = os.getenv("ALERTS_LOG_FILE", "alerts.log")
-AUDITS_LOG_FILE = os.getenv("AUDITS_LOG_FILE", "audits.log")
-INCIDENTS_LOG_FILE = os.getenv("INCIDENTS_LOG_FILE", "incidents.log")
-APP_LOG_FILE = os.getenv("APP_LOG_FILE", "cortex_xdr_app.log")
+ALERTS_LOG_FILE = os.getenv("ALERTS_LOG_FILE", "/opt/cortex_xdr_v3/alerts.log")
+AUDITS_LOG_FILE = os.getenv("AUDITS_LOG_FILE", "/opt/cortex_xdr_v3/audits.log")
+INCIDENTS_LOG_FILE = os.getenv("INCIDENTS_LOG_FILE", "/opt/cortex_xdr_v3/incidents.log")
+APP_LOG_FILE = os.getenv("APP_LOG_FILE", "/opt/cortex_xdr_v3/cortex_xdr_app.log")
 
 # Obtener el nombre del host para los logs
 hostname = socket.gethostname()
