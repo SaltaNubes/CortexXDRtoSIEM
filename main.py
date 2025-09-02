@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Developed by Devel Security
 # cjRAM
-# Version 3.2.0
+# Version 3.3.0
 # Modificado para incluir integración con Wazuh y paginación para obtener todos los resultados.
 # Modificado para leer los tags de filtrado desde el archivo .env
 
@@ -29,7 +29,9 @@ api_name3 = os.getenv("API_NAME3")
 api_call3 = os.getenv("API_CALL3")
 auth_id = os.getenv("AUTH_ID")
 auth_key = os.getenv("AUTH_KEY")
-time_offset_seconds = int(os.getenv("TIME_OFFSET_SECONDS", 300))  # Aumentado para tener un margen mayor
+time_offset_seconds = int(os.getenv("TIME_OFFSET_SECONDS", 300))
+enable_audit = os.getenv("ENABLE_AUDIT", "false").lower() in ("1", "true", "yes", "on")
+
 
 # Configuración de Syslog
 syslog_ip = os.getenv("SYSLOG_IP", "127.0.0.1")
@@ -48,10 +50,10 @@ filter_tags = [tag.strip() for tag in filter_tags_str.split(',') if tag.strip()]
 
 
 # Configuración de archivos de log de salida
-ALERTS_LOG_FILE = os.getenv("ALERTS_LOG_FILE", "/opt/cortex_xdr_v3/alerts.log")
-AUDITS_LOG_FILE = os.getenv("AUDITS_LOG_FILE", "/opt/cortex_xdr_v3/audits.log")
-INCIDENTS_LOG_FILE = os.getenv("INCIDENTS_LOG_FILE", "/opt/cortex_xdr_v3/incidents.log")
-APP_LOG_FILE = os.getenv("APP_LOG_FILE", "/opt/cortex_xdr_v3/cortex_xdr_app.log")
+ALERTS_LOG_FILE = os.getenv("ALERTS_LOG_FILE", "alerts.log")
+AUDITS_LOG_FILE = os.getenv("AUDITS_LOG_FILE", "audits.log")
+INCIDENTS_LOG_FILE = os.getenv("INCIDENTS_LOG_FILE", "incidents.log")
+APP_LOG_FILE = os.getenv("APP_LOG_FILE", "cortex_xdr_app.log")
 
 # Obtener el nombre del host para los logs
 hostname = socket.gethostname()
@@ -109,7 +111,7 @@ def fetch_all_results(url, payload, data_key, endpoint_name):
             # fallback genérico
             request_payload['request_data']['limit'] = page_size
 
-        logging.info(f"[{endpoint_name}] Obteniendo resultados desde {search_from}...")
+        logging.debug(f"[{endpoint_name}] Obteniendo resultados desde {search_from}...")
 
         try:
             response = requests.post(url, headers=headers, json=request_payload)
@@ -128,13 +130,13 @@ def fetch_all_results(url, payload, data_key, endpoint_name):
                 break
 
             all_results.extend(results_on_page)
-            logging.info(
+            logging.debug(
                 f"[{endpoint_name}] Obtenidos {len(results_on_page)} resultados. "
                 f"Total acumulado: {len(all_results)} de {total_count}."
             )
 
             if len(all_results) >= total_count:
-                logging.info(f"[{endpoint_name}] Se han obtenido todos los {total_count} resultados.")
+                logging.debug(f"[{endpoint_name}] Se han obtenido todos los {total_count} resultados.")
                 break
 
             # preparar siguiente página
@@ -213,7 +215,7 @@ def process_and_dispatch_events(events, log_file_path):
 
 def main():
     """Función principal del script."""
-    logging.info("Iniciando ejecución del script de Cortex XDR con paginación.")
+    logging.info("Iniciando ejecucion del script de Cortex XDR con paginacion.")
     gte_value = calculate_gte()
 
     # --- 1. Obtener Alertas ---
@@ -226,7 +228,7 @@ def main():
     }
     all_alerts = fetch_all_results(url1, payload_alerts, 'alerts', 'Alertas')
     if all_alerts:
-        logging.info(f"Total de alertas obtenidas después de paginación: {len(all_alerts)}")
+        logging.info(f"Total de alertas obtenidas despues de paginacion: {len(all_alerts)}")
 
         # 🔎 Filtrar por tags si se han definido en .env
         if filter_tags:
@@ -234,7 +236,7 @@ def main():
             filtered_alerts = filter_events_by_tags(all_alerts, filter_tags)
             logging.info(f"Total de alertas después de aplicar filtro: {len(filtered_alerts)}")
         else:
-            logging.info("No se han configurado FILTER_TAGS, se procesarán todas las alertas.")
+            logging.warning("No se han configurado FILTER_TAGS, se procesaran todas las alertas.")
             filtered_alerts = all_alerts
 
         if filtered_alerts:
@@ -244,17 +246,22 @@ def main():
 
 
     # --- 2. Obtener Eventos de Auditoría ---
-    payload_audit = {
-        "request_data": {
-            "filters": [{"field": "timestamp", "operator": "gte", "value": gte_value}],
+    if enable_audit:
+        payload_audit = {
+            "request_data": {
+                "filters": [{"field": "timestamp", "operator": "gte", "value": gte_value}],
+            }
         }
-    }
-    all_audits = fetch_all_results(url2, payload_audit, 'data', 'Eventos de Auditoría')
-    if all_audits:
-        logging.info(f"Total de eventos de auditoría obtenidos después de paginación: {len(all_audits)}")
-        process_and_dispatch_events(all_audits, AUDITS_LOG_FILE)
+
+        all_audits = fetch_all_results(url2, payload_audit, 'data', 'Eventos de Auditoría')
+
+        if all_audits:
+            logging.info(f"Total de eventos de auditoría obtenidos después de paginación: {len(all_audits)}")
+            process_and_dispatch_events(all_audits, AUDITS_LOG_FILE)
+        else:
+            logging.warning("No se encontraron nuevos eventos de auditoría o hubo un error al obtenerlos.")
     else:
-        logging.info("No se encontraron nuevos eventos de auditoría o hubo un error al obtenerlos.")
+        logging.warning("Se deshabilito la obtencion de eventos de auditoria")
 
     # --- 3. Obtener Incidentes ---
     payload_incidents = {
@@ -270,11 +277,11 @@ def main():
 
         # 🔎 Filtrar por tags si se han definido en .env
         if filter_tags:
-            logging.info(f"Aplicando filtro de tags para incidentes: {filter_tags}")
+            logging.debug(f"Aplicando filtro de tags para incidentes: {filter_tags}")
             filtered_incidents = filter_events_by_tags(all_incidents, filter_tags)
             logging.info(f"Total de incidentes después de aplicar filtro: {len(filtered_incidents)}")
         else:
-            logging.info("No se han configurado FILTER_TAGS, se procesarán todos los incidentes.")
+            logging.warning("No se han configurado FILTER_TAGS, se procesaran todos los incidentes.")
             filtered_incidents = all_incidents
 
         if filtered_incidents:
@@ -282,7 +289,7 @@ def main():
         else:
             logging.info("No se encontraron incidentes que coincidan con los tags requeridos.")
 
-    logging.info("Ejecución del script finalizada.")
+    logging.info("Ejecucion del script finalizada.")
 
 if __name__ == "__main__":
     main()
