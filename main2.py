@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Developed by Devel Security
 # cjRAM
-# Version 3.4.0 (TCP Added)
-# Modificado para incluir integración con Wazuh, TCP y paginación.
+# Version 3.5.0 (Explicit UDP/TCP Split)
+# Modificado para separar configuraciones UDP y TCP explícitamente.
 
 import requests
 from dotenv import load_dotenv
@@ -31,14 +31,14 @@ auth_key = os.getenv("AUTH_KEY")
 time_offset_seconds = int(os.getenv("TIME_OFFSET_SECONDS", 300))
 enable_audit = os.getenv("ENABLE_AUDIT", "false").lower() in ("1", "true", "yes", "on")
 
-# Configuración de Syslog (UDP)
-syslog_ip = os.getenv("SYSLOG_IP", "127.0.0.1")
-syslog_port = int(os.getenv("SYSLOG_PORT", 514))
-syslog_enabled = os.getenv("SYSLOG_ENABLED", "false").lower() == "true"
+# --- NUEVO: Configuración Explícita UDP ---
+udp_host = os.getenv("UDP_HOST", "127.0.0.1")
+udp_port = int(os.getenv("UDP_PORT", 514))
+udp_enabled = os.getenv("UDP_ENABLED", "false").lower() == "true"
 
-# --- NUEVO: Configuración de TCP ---
-tcp_ip = os.getenv("TCP_IP", "127.0.0.1")
-tcp_port = int(os.getenv("TCP_PORT", 514)) # Puerto común TCP puede ser 514, 601 o el que uses
+# --- NUEVO: Configuración Explícita TCP ---
+tcp_host = os.getenv("TCP_HOST", "127.0.0.1")
+tcp_port = int(os.getenv("TCP_PORT", 514))
 tcp_enabled = os.getenv("TCP_ENABLED", "false").lower() == "true"
 
 # Configuración de Wazuh
@@ -90,6 +90,8 @@ def fetch_all_results(url, payload, data_key, endpoint_name):
 
     while True:
         request_payload = copy.deepcopy(base_payload)
+        
+        # Lógica de paginación según el endpoint
         if endpoint_name in ['Alertas', 'Incidentes']:
             request_payload['request_data']['search_from'] = search_from
             request_payload['request_data']['search_to'] = search_from + page_size
@@ -119,17 +121,17 @@ def fetch_all_results(url, payload, data_key, endpoint_name):
                 break
 
             all_results.extend(results_on_page)
-            logging.debug(f"[{endpoint_name}] Obtenidos {len(results_on_page)}. Total: {len(all_results)}/{total_count}.")
+            logging.debug(f"[{endpoint_name}] Progreso: {len(all_results)} / {total_count}")
 
             if len(all_results) >= total_count:
-                logging.debug(f"[{endpoint_name}] Todos los resultados obtenidos.")
+                logging.debug(f"[{endpoint_name}] Carga completa.")
                 break
 
             search_from += page_size
-            time.sleep(1)
+            time.sleep(0.5) # Pequeña pausa para no saturar
 
         except Exception as e:
-            logging.critical(f"[{endpoint_name}] Error: {e}")
+            logging.critical(f"[{endpoint_name}] Error crítico: {e}")
             break
 
     return all_results
@@ -148,38 +150,38 @@ def filter_events_by_tags(events: list, required_tags: list) -> list:
             filtered.append(event)
     return filtered
 
-def send_to_syslog(message_json):
-    """Envía mensaje por UDP (Syslog standard)."""
-    if not syslog_enabled:
+# --- FUNCIÓN PARA ENVÍO UDP ---
+def send_to_udp(message_json):
+    """Envía un mensaje vía UDP (Fire-and-forget)."""
+    if not udp_enabled:
         return
     try:
+        # En UDP no es estrictamente necesario el salto de línea, pero ayuda.
         message = f"{message_json}"
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.sendto(message.encode('utf-8'), (syslog_ip, syslog_port))
+            sock.sendto(message.encode('utf-8'), (udp_host, udp_port))
     except Exception as e:
-        logging.error(f"Error UDP Syslog: {e}")
+        logging.error(f"Error enviando UDP a {udp_host}:{udp_port} - {e}")
 
+# --- FUNCIÓN PARA ENVÍO TCP ---
 def send_to_tcp(message_json):
-    """
-    Envía mensaje por TCP.
-    IMPORTANTE: Añade un salto de línea al final para separar eventos en el stream.
-    """
+    """Envía un mensaje vía TCP (Conexión establecida)."""
     if not tcp_enabled:
         return
     try:
-        # Añadimos \n porque TCP es un stream continuo
+        # En TCP ES CRÍTICO el salto de línea para separar eventos en el stream
         message = f"{message_json}\n"
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(5) # Timeout de 5 segundos para evitar bloqueos
-            sock.connect((tcp_ip, tcp_port))
+            sock.settimeout(5) # Timeout de 5s para evitar bloqueos
+            sock.connect((tcp_host, tcp_port))
             sock.sendall(message.encode('utf-8'))
     except socket.error as e:
-        logging.error(f"Error de conexión TCP ({tcp_ip}:{tcp_port}): {e}")
+        logging.error(f"Error de conexión TCP a {tcp_host}:{tcp_port} - {e}")
     except Exception as e:
         logging.error(f"Error inesperado TCP: {e}")
 
 def send_to_wazuh_socket(event_json):
-    """Envía evento al socket Unix de Wazuh."""
+    """Envía un evento al socket local de Wazuh."""
     if not wazuh_socket_enabled:
         return
     try:
@@ -188,29 +190,25 @@ def send_to_wazuh_socket(event_json):
             sock.connect(wazuh_socket_path)
             sock.send(wazuh_msg.encode('utf-8'))
     except Exception as e:
-        logging.error(f"Error Wazuh Socket: {e}")
+        logging.error(f"Error enviando a Wazuh Socket: {e}")
 
 def process_and_dispatch_events(events, log_file_path):
-    """Escribe en archivo y envía a Syslog (UDP), TCP y Wazuh Socket."""
+    """Orquesta el envío a todos los destinos configurados."""
     with open(log_file_path, 'a', encoding='utf-8') as file:
         for event in events:
             event_json = json.dumps(event, ensure_ascii=False)
             
-            # 1. Escribir en archivo local
+            # 1. Guardar en archivo
             file.write(event_json + '\n')
             
-            # 2. Enviar UDP
-            send_to_syslog(event_json)
-            
-            # 3. Enviar TCP (NUEVO)
+            # 2. Enviar a destinos de red
+            send_to_udp(event_json)
             send_to_tcp(event_json)
-            
-            # 4. Enviar Wazuh Socket
             send_to_wazuh_socket(event_json)
 
 def main():
     """Función principal."""
-    logging.info("Iniciando script Cortex XDR (v3.4.0 TCP).")
+    logging.info("Iniciando ejecución (Modo: UDP/TCP Explícitos).")
     gte_value = calculate_gte()
 
     # --- 1. Alertas ---
@@ -223,15 +221,16 @@ def main():
     }
     all_alerts = fetch_all_results(url1, payload_alerts, 'alerts', 'Alertas')
     if all_alerts:
-        logging.info(f"Alertas obtenidas: {len(all_alerts)}")
+        logging.info(f"Alertas encontradas: {len(all_alerts)}")
         
-        filtered_alerts = filter_events_by_tags(all_alerts, filter_tags) if filter_tags else all_alerts
+        # Filtrado
+        final_alerts = filter_events_by_tags(all_alerts, filter_tags) if filter_tags else all_alerts
         
-        if filtered_alerts:
-            logging.info(f"Procesando {len(filtered_alerts)} alertas.")
-            process_and_dispatch_events(filtered_alerts, ALERTS_LOG_FILE)
+        if final_alerts:
+            logging.info(f"Procesando {len(final_alerts)} alertas.")
+            process_and_dispatch_events(final_alerts, ALERTS_LOG_FILE)
         else:
-            logging.info("Alertas filtradas por tags: 0 coincidencias.")
+            logging.info("Alertas descartadas por filtro de tags.")
 
     # --- 2. Auditoría ---
     if enable_audit:
@@ -242,7 +241,7 @@ def main():
         }
         all_audits = fetch_all_results(url2, payload_audit, 'data', 'Eventos de Auditoría')
         if all_audits:
-            logging.info(f"Auditorías obtenidas: {len(all_audits)}")
+            logging.info(f"Eventos de auditoría encontrados: {len(all_audits)}")
             process_and_dispatch_events(all_audits, AUDITS_LOG_FILE)
     
     # --- 3. Incidentes ---
@@ -255,15 +254,16 @@ def main():
     }
     all_incidents = fetch_all_results(url3, payload_incidents, 'incidents', 'Incidentes')
     if all_incidents:
-        logging.info(f"Incidentes obtenidos: {len(all_incidents)}")
+        logging.info(f"Incidentes encontrados: {len(all_incidents)}")
         
-        filtered_incidents = filter_events_by_tags(all_incidents, filter_tags) if filter_tags else all_incidents
+        # Filtrado
+        final_incidents = filter_events_by_tags(all_incidents, filter_tags) if filter_tags else all_incidents
         
-        if filtered_incidents:
-            logging.info(f"Procesando {len(filtered_incidents)} incidentes.")
-            process_and_dispatch_events(filtered_incidents, INCIDENTS_LOG_FILE)
+        if final_incidents:
+            logging.info(f"Procesando {len(final_incidents)} incidentes.")
+            process_and_dispatch_events(final_incidents, INCIDENTS_LOG_FILE)
         else:
-            logging.info("Incidentes filtrados por tags: 0 coincidencias.")
+            logging.info("Incidentes descartados por filtro de tags.")
 
     logging.info("Ejecución finalizada.")
 
