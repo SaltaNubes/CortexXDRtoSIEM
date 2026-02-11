@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # Developed by Devel Security
 # cjRAM
-# Version 3.3.0
-# Modificado para incluir integración con Wazuh y paginación para obtener todos los resultados.
-# Modificado para leer los tags de filtrado desde el archivo .env
+# Version 3.5.1 (Fix: Handle list/str tags)
+# Modificado para soportar tags como lista o string y separación explícita UDP/TCP.
 
 import requests
 from dotenv import load_dotenv
@@ -32,22 +31,23 @@ auth_key = os.getenv("AUTH_KEY")
 time_offset_seconds = int(os.getenv("TIME_OFFSET_SECONDS", 300))
 enable_audit = os.getenv("ENABLE_AUDIT", "false").lower() in ("1", "true", "yes", "on")
 
+# --- Configuración Explícita UDP ---
+udp_host = os.getenv("UDP_HOST", "127.0.0.1")
+udp_port = int(os.getenv("UDP_PORT", 514))
+udp_enabled = os.getenv("UDP_ENABLED", "false").lower() == "true"
 
-# Configuración de Syslog
-syslog_ip = os.getenv("SYSLOG_IP", "127.0.0.1")
-syslog_port = int(os.getenv("SYSLOG_PORT", 514))
-syslog_enabled = os.getenv("SYSLOG_ENABLED", "false").lower() == "true"
+# --- Configuración Explícita TCP ---
+tcp_host = os.getenv("TCP_HOST", "127.0.0.1")
+tcp_port = int(os.getenv("TCP_PORT", 514))
+tcp_enabled = os.getenv("TCP_ENABLED", "false").lower() == "true"
 
 # Configuración de Wazuh
 wazuh_socket_path = os.getenv("WAZUH_SOCKET_PATH", "/var/ossec/queue/sockets/queue")
 wazuh_socket_enabled = os.getenv("WAZUH_SOCKET_ENABLED", "false").lower() == "true"
 
-# --- NUEVO: Configuración de Tags para filtrar ---
-# Los tags deben estar separados por comas en el archivo .env
+# --- Configuración de Tags para filtrar ---
 filter_tags_str = os.getenv("FILTER_TAGS", "")
-# Convertir el string de tags en una lista, eliminando espacios y entradas vacías
 filter_tags = [tag.strip() for tag in filter_tags_str.split(',') if tag.strip()] if filter_tags_str else []
-
 
 # Configuración de archivos de log de salida
 ALERTS_LOG_FILE = os.getenv("ALERTS_LOG_FILE", "alerts.log")
@@ -55,7 +55,6 @@ AUDITS_LOG_FILE = os.getenv("AUDITS_LOG_FILE", "audits.log")
 INCIDENTS_LOG_FILE = os.getenv("INCIDENTS_LOG_FILE", "incidents.log")
 APP_LOG_FILE = os.getenv("APP_LOG_FILE", "cortex_xdr_app.log")
 
-# Obtener el nombre del host para los logs
 hostname = socket.gethostname()
 
 # --- Configuración del logging ---
@@ -79,36 +78,27 @@ headers = {
 }
 
 def calculate_gte():
-    """Calcula el valor de 'gte' como la fecha y hora actual menos el tiempo offset en segundos."""
+    """Calcula el valor de 'gte'."""
     return int((datetime.now() - timedelta(seconds=time_offset_seconds)).timestamp() * 1000)
 
 def fetch_all_results(url, payload, data_key, endpoint_name):
-    """
-    Obtiene todos los resultados de un endpoint de Cortex XDR usando paginación.
-    - Alertas / Incidentes -> usan search_from, search_to y search_size.
-    - Auditoría -> usa from + limit.
-    """
+    """Obtiene todos los resultados usando paginación."""
     all_results = []
     search_from = 0
-    page_size = 100  # tamaño máximo permitido por XDR
+    page_size = 100
     base_payload = copy.deepcopy(payload)
 
     while True:
         request_payload = copy.deepcopy(base_payload)
-
+        
         if endpoint_name in ['Alertas', 'Incidentes']:
-            # offset-based pagination
             request_payload['request_data']['search_from'] = search_from
             request_payload['request_data']['search_to'] = search_from + page_size
             request_payload['request_data']['search_size'] = page_size
-
         elif endpoint_name == 'Eventos de Auditoría':
-            # auditoría usa from + limit
             request_payload['request_data']['from'] = search_from
             request_payload['request_data']['limit'] = page_size
-
         else:
-            # fallback genérico
             request_payload['request_data']['limit'] = page_size
 
         logging.debug(f"[{endpoint_name}] Obteniendo resultados desde {search_from}...")
@@ -130,68 +120,81 @@ def fetch_all_results(url, payload, data_key, endpoint_name):
                 break
 
             all_results.extend(results_on_page)
-            logging.debug(
-                f"[{endpoint_name}] Obtenidos {len(results_on_page)} resultados. "
-                f"Total acumulado: {len(all_results)} de {total_count}."
-            )
+            logging.debug(f"[{endpoint_name}] Progreso: {len(all_results)} / {total_count}")
 
             if len(all_results) >= total_count:
-                logging.debug(f"[{endpoint_name}] Se han obtenido todos los {total_count} resultados.")
+                logging.debug(f"[{endpoint_name}] Carga completa.")
                 break
 
-            # preparar siguiente página
             search_from += page_size
-            time.sleep(1)
+            time.sleep(0.5)
 
-        except requests.exceptions.HTTPError as http_err:
-            logging.critical(f"[{endpoint_name}] Error HTTP: {http_err} - Body: {http_err.response.text}")
-            break
-        except requests.exceptions.RequestException as req_err:
-            logging.critical(f"[{endpoint_name}] Error de red o conexión: {req_err}")
-            break
         except Exception as e:
-            logging.critical(f"[{endpoint_name}] Error inesperado: {e}")
+            logging.critical(f"[{endpoint_name}] Error crítico: {e}")
             break
 
     return all_results
 
 def filter_events_by_tags(events: list, required_tags: list) -> list:
     """
-    Filtra los eventos que contengan al menos uno de los tags exactos requeridos.
-
-    :param events: Lista de eventos (dicts) que contienen el campo 'original_tags'.
-    :param required_tags: Lista de tags a buscar (ej: ["ET:GYT_123", "EG:SG&T"]).
-    :return: Lista de eventos que cumplen la condición.
+    Filtra eventos por tags.
+    Maneja correctamente si 'original_tags' es una lista o un string separado por comas.
     """
     if not required_tags:
-        return events # Si no hay tags para filtrar, devuelve todos los eventos
-
+        return events
+    
     filtered = []
     for event in events:
-        tags_str = event.get("original_tags", "")
-        if not tags_str:
-            continue
+        raw_tags = event.get("original_tags")
         
-        tags = [tag.strip() for tag in tags_str.split(",")]  # separamos en tags exactos
-        if any(req in tags for req in required_tags):        # coincidencia exacta
+        # Si no hay tags, saltamos
+        if not raw_tags:
+            continue
+            
+        current_event_tags = []
+        
+        # CASO 1: Es una lista (común en Incidentes)
+        if isinstance(raw_tags, list):
+            current_event_tags = [str(t).strip() for t in raw_tags]
+            
+        # CASO 2: Es un string (común en Alertas antiguas)
+        elif isinstance(raw_tags, str):
+            current_event_tags = [t.strip() for t in raw_tags.split(",")]
+            
+        # Verificar coincidencia
+        if any(req in current_event_tags for req in required_tags):
             filtered.append(event)
+            
     return filtered
 
-def send_to_syslog(message_json):
-    """Envía un mensaje al servidor syslog si está activado."""
-    if not syslog_enabled:
+def send_to_udp(message_json):
+    """Envía un mensaje vía UDP."""
+    if not udp_enabled:
         return
     try:
         message = f"{message_json}"
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.sendto(message.encode('utf-8'), (syslog_ip, syslog_port))
-    except socket.error as e:
-        logging.error(f"Error de socket al enviar a syslog ({syslog_ip}:{syslog_port}): {e}")
+            sock.sendto(message.encode('utf-8'), (udp_host, udp_port))
     except Exception as e:
-        logging.error(f"Error inesperado al enviar a syslog: {e}")
+        logging.error(f"Error enviando UDP a {udp_host}:{udp_port} - {e}")
+
+def send_to_tcp(message_json):
+    """Envía un mensaje vía TCP."""
+    if not tcp_enabled:
+        return
+    try:
+        message = f"{message_json}\n"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect((tcp_host, tcp_port))
+            sock.sendall(message.encode('utf-8'))
+    except socket.error as e:
+        logging.error(f"Error de conexión TCP a {tcp_host}:{tcp_port} - {e}")
+    except Exception as e:
+        logging.error(f"Error inesperado TCP: {e}")
 
 def send_to_wazuh_socket(event_json):
-    """Envía un evento al socket de Wazuh si está activado."""
+    """Envía un evento al socket local de Wazuh."""
     if not wazuh_socket_enabled:
         return
     try:
@@ -199,26 +202,29 @@ def send_to_wazuh_socket(event_json):
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
             sock.connect(wazuh_socket_path)
             sock.send(wazuh_msg.encode('utf-8'))
-    except socket.error as e:
-        logging.error(f"Error al enviar evento al socket de Wazuh ({wazuh_socket_path}): {e}")
     except Exception as e:
-        logging.error(f"Ocurrió un error inesperado al intentar enviar a Wazuh: {e}")
+        logging.error(f"Error enviando a Wazuh Socket: {e}")
 
 def process_and_dispatch_events(events, log_file_path):
-    """Escribe cada evento en un archivo, lo envía a syslog y al socket de Wazuh."""
+    """Orquesta el envío a todos los destinos configurados."""
     with open(log_file_path, 'a', encoding='utf-8') as file:
         for event in events:
             event_json = json.dumps(event, ensure_ascii=False)
+            
+            # 1. Guardar en archivo
             file.write(event_json + '\n')
-            send_to_syslog(event_json)
+            
+            # 2. Enviar a destinos de red
+            send_to_udp(event_json)
+            send_to_tcp(event_json)
             send_to_wazuh_socket(event_json)
 
 def main():
-    """Función principal del script."""
-    logging.info("Iniciando ejecucion del script de Cortex XDR con paginacion.")
+    """Función principal."""
+    logging.info("Iniciando ejecución (Modo: UDP/TCP Explícitos - Fix List Tags).")
     gte_value = calculate_gte()
 
-    # --- 1. Obtener Alertas ---
+    # --- 1. Alertas ---
     payload_alerts = {
         "request_data": {
             "filters": [{"field": "creation_time", "operator": "gte", "value": gte_value}],
@@ -228,42 +234,28 @@ def main():
     }
     all_alerts = fetch_all_results(url1, payload_alerts, 'alerts', 'Alertas')
     if all_alerts:
-        logging.info(f"Total de alertas obtenidas despues de paginacion: {len(all_alerts)}")
-
-        # 🔎 Filtrar por tags si se han definido en .env
-        if filter_tags:
-            logging.info(f"Aplicando filtro de tags para alertas: {filter_tags}")
-            filtered_alerts = filter_events_by_tags(all_alerts, filter_tags)
-            logging.info(f"Total de alertas después de aplicar filtro: {len(filtered_alerts)}")
+        logging.info(f"Alertas encontradas: {len(all_alerts)}")
+        final_alerts = filter_events_by_tags(all_alerts, filter_tags) if filter_tags else all_alerts
+        
+        if final_alerts:
+            logging.info(f"Procesando {len(final_alerts)} alertas.")
+            process_and_dispatch_events(final_alerts, ALERTS_LOG_FILE)
         else:
-            logging.warning("No se han configurado FILTER_TAGS, se procesaran todas las alertas.")
-            filtered_alerts = all_alerts
+            logging.info("Alertas descartadas por filtro de tags.")
 
-        if filtered_alerts:
-            process_and_dispatch_events(filtered_alerts, ALERTS_LOG_FILE)
-        else:
-            logging.info("No se encontraron alertas que coincidan con los tags requeridos.")
-
-
-    # --- 2. Obtener Eventos de Auditoría ---
+    # --- 2. Auditoría ---
     if enable_audit:
         payload_audit = {
             "request_data": {
                 "filters": [{"field": "timestamp", "operator": "gte", "value": gte_value}],
             }
         }
-
         all_audits = fetch_all_results(url2, payload_audit, 'data', 'Eventos de Auditoría')
-
         if all_audits:
-            logging.info(f"Total de eventos de auditoría obtenidos después de paginación: {len(all_audits)}")
+            logging.info(f"Eventos de auditoría encontrados: {len(all_audits)}")
             process_and_dispatch_events(all_audits, AUDITS_LOG_FILE)
-        else:
-            logging.warning("No se encontraron nuevos eventos de auditoría o hubo un error al obtenerlos.")
-    else:
-        logging.warning("Se deshabilito la obtencion de eventos de auditoria")
-
-    # --- 3. Obtener Incidentes ---
+    
+    # --- 3. Incidentes ---
     payload_incidents = {
         "request_data": {
             "filters": [{"field": "creation_time", "operator": "gte", "value": gte_value}],
@@ -273,23 +265,16 @@ def main():
     }
     all_incidents = fetch_all_results(url3, payload_incidents, 'incidents', 'Incidentes')
     if all_incidents:
-        logging.info(f"Total de incidentes obtenidos después de paginación: {len(all_incidents)}")
-
-        # 🔎 Filtrar por tags si se han definido en .env
-        if filter_tags:
-            logging.debug(f"Aplicando filtro de tags para incidentes: {filter_tags}")
-            filtered_incidents = filter_events_by_tags(all_incidents, filter_tags)
-            logging.info(f"Total de incidentes después de aplicar filtro: {len(filtered_incidents)}")
+        logging.info(f"Incidentes encontrados: {len(all_incidents)}")
+        final_incidents = filter_events_by_tags(all_incidents, filter_tags) if filter_tags else all_incidents
+        
+        if final_incidents:
+            logging.info(f"Procesando {len(final_incidents)} incidentes.")
+            process_and_dispatch_events(final_incidents, INCIDENTS_LOG_FILE)
         else:
-            logging.warning("No se han configurado FILTER_TAGS, se procesaran todos los incidentes.")
-            filtered_incidents = all_incidents
+            logging.info("Incidentes descartados por filtro de tags.")
 
-        if filtered_incidents:
-            process_and_dispatch_events(filtered_incidents, INCIDENTS_LOG_FILE)
-        else:
-            logging.info("No se encontraron incidentes que coincidan con los tags requeridos.")
-
-    logging.info("Ejecucion del script finalizada.")
+    logging.info("Ejecución finalizada.")
 
 if __name__ == "__main__":
     main()
